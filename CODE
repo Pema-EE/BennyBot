@@ -1,5 +1,6 @@
 
-//the entire code for balancing the bot.  [arduinoIDE file](): 
+//the entire code for balancing the bot. 
+[arduinoIDE file](BennyBot.ino): 
 //CODE STARTS
 #include <Wire.h>
 #include <AccelStepper.h>
