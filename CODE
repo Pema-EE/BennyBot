@@ -1,0 +1,211 @@
+
+//the entire code for balancing the bot.  [arduinoIDE file](): 
+//CODE STARTS
+#include <Wire.h>
+#include <AccelStepper.h>
+
+
+// ---- Motor 1 (left wheel) ----
+#define stepPin 25
+#define dirPin 26
+#define enPin 27            // shared EN line - assumes both TMC2209 EN pins are tied together in hardware.
+                            // If they're on separate ESP32 pins instead, add a second enPin and mirror every digitalWrite(enPin, ...) below.
+
+// ---- Motor 2 (right wheel) ---- NEW: a balancing bot needs both wheels driven, so this is a second, independent stepper
+#define stepPin2 32         // <-- change to whatever GPIO you actually wired motor 2's STEP to
+#define dirPin2 33          // <-- change to whatever GPIO you actually wired motor 2's DIR to
+
+AccelStepper stepper(AccelStepper::Driver, stepPin, dirPin);
+AccelStepper stepper2(AccelStepper::Driver, stepPin2, dirPin2);   // NEW: one AccelStepper object drives exactly one motor, so a second wheel needs a second object
+
+const float MAX_SPEED = 2000.0;     // steps/sec ceiling - also doubles as the PID output clamp so it never asks for a speed the stepper can't do
+const int MOTOR2_INVERT = -1;       // NEW: the two wheels face opposite ways on the axle, so the same "spin forward" command needs opposite sign on each motor - flip to +1 if your wiring already handles this
+
+// ---- PID gains ---- NEW: this is the actual balance controller. Start with Ki=Kd=0, raise Kp until it oscillates, back off ~40%, then add Kd to damp, then a small Ki last.
+float Kp = 15.0;
+float Ki = 0.0;
+float Kd = 0.5;
+float targetAngle = 0.0;    // upright setpoint - nudge a degree or two if the calibrated zero isn't quite centered on the real balance point
+
+// ---- PID state ---- NEW: values the PID needs to carry over between loop passes
+float integral = 0.0;
+float lastError = 0.0;
+const float INTEGRAL_LIMIT = 50.0;    // NEW: anti-windup - caps how far the integral term can build up
+
+// ---- Safety cutoff ---- NEW: without this, a fallen bot keeps commanding full speed into the floor until it overheats or you unplug it
+const float FALL_ANGLE = 45.0;        // degrees past which we treat the bot as fallen and stop driving
+
+// ---- Fixed-rate control loop timing ---- NEW: ties the filter + PID to a known, steady time step instead of however fast loop() happens to spin
+const unsigned long CONTROL_INTERVAL_US = 5000;    // 200 Hz - reasonable starting point, raise later if the loop keeps up cleanly
+unsigned long lastControlTime = 0;
+
+
+
+
+
+
+
+const int MPU_ADDR = 0x68;
+
+const float ACCEL_SCALE = 16384.0; // LSB/g,     +/-2g  (power-on default)
+const float GYRO_SCALE  = 131.0;   // LSB/deg/s, +/-250 dps (power-on default)
+const float ALPHA = 0.98;
+
+float gyroYoffset = 0.0;
+float tiltAngle = 0.0;
+unsigned long lastMicros;
+
+bool readMPU(int16_t &ax, int16_t &az, int16_t &gy) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(MPU_ADDR, 14, true) != 14) return false;
+
+  uint8_t b[14];
+  for (int i = 0; i < 14; i++) b[i] = Wire.read();
+
+  ax = (int16_t)((b[0]  << 8) | b[1]);   // accel X
+  az = (int16_t)((b[4]  << 8) | b[5]);   // accel Z
+  gy = (int16_t)((b[10] << 8) | b[11]);  // gyro Y
+  return true;
+}
+
+void calibrateGyroY() {
+  const int N = 2000;
+  double sum = 0;
+  int good = 0;
+  int16_t ax, az, gy;
+
+  Serial.println("Calibrating - keep the bot completely still...");
+  delay(500);
+
+  for (int i = 0; i < N; i++) {
+    if (readMPU(ax, az, gy)) {
+      sum += gy / GYRO_SCALE;
+      good++;
+    }
+    delay(1);
+  }
+
+  if (good < N * 0.9) {
+    Serial.println("WARNING: many failed reads during calibration - check wiring.");
+  }
+
+  gyroYoffset = sum / good;
+  Serial.print("Gyro Y bias: "); Serial.println(gyroYoffset, 4);
+}
+
+float getTiltAngle() {
+  int16_t rawAX, rawAZ, rawGY;
+
+  if (!readMPU(rawAX, rawAZ, rawGY)) {
+    Serial.println("ERROR: MPU6050 read failed - holding last angle");
+    return tiltAngle;  // never hand a control loop a fabricated number
+  }
+
+  float accX_g = rawAX / ACCEL_SCALE;
+  float accZ_g = rawAZ / ACCEL_SCALE;
+  float gyroY_rate = (rawGY / GYRO_SCALE) - gyroYoffset;
+
+  unsigned long now = micros();
+  float dt = (now - lastMicros) / 1000000.0;
+  lastMicros = now;
+
+  float accelAngle = atan2(accX_g, accZ_g) * RAD_TO_DEG;
+  tiltAngle = ALPHA * (tiltAngle + gyroY_rate * dt) + (1.0 - ALPHA) * accelAngle;
+  return tiltAngle;
+}
+
+void setup() {
+pinMode(enPin,OUTPUT);
+digitalWrite(enPin,LOW);       // LOW = driver enabled on most TMC2209 boards - confirm against your board's EN polarity
+
+stepper.setMaxSpeed(MAX_SPEED);
+stepper2.setMaxSpeed(MAX_SPEED);    // NEW: second motor needs its own max speed limit set too
+// No fixed setSpeed() here anymore - the PID loop below drives speed continuously based on tilt error
+
+
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+
+  Wire.beginTransmission(MPU_ADDR);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("CRITICAL: MPU6050 not found. Check wiring on GPIO 21/22.");
+    while (1) delay(100);
+  }
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B); Wire.write(0x00);  // wake up
+  Wire.endTransmission(true);
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1A); Wire.write(0x03);  // DLPF ~44 Hz, cuts vibration noise
+  Wire.endTransmission(true);
+
+  delay(100);
+
+  calibrateGyroY();
+
+  int16_t ax, az, gy;
+  readMPU(ax, az, gy);
+  tiltAngle = atan2(ax / ACCEL_SCALE, az / ACCEL_SCALE) * RAD_TO_DEG; // seed real angle
+
+  lastMicros = micros();
+}
+
+void loop() {
+  // NEW: service both steppers on every single pass of loop(), not just when we
+  // update the PID. runSpeed() checks internally whether enough time has passed
+  // to emit the next pulse at the last commanded speed - call it rarely and the
+  // step pulses become uneven or stall.
+  stepper.runSpeed();
+  stepper2.runSpeed();
+
+  // NEW: only recompute angle + PID on a fixed schedule instead of every pass of
+  // loop(). This is what replaces the old delay(10) - that delay blocked the CPU
+  // for 10ms at a time, during which neither stepper could be serviced at all.
+  unsigned long now = micros();
+  if (now - lastControlTime < CONTROL_INTERVAL_US) return;
+  lastControlTime = now;
+
+  float dt = CONTROL_INTERVAL_US / 1000000.0;   // fixed nominal timestep in seconds, since this block runs on a fixed schedule
+  float angle = getTiltAngle();
+  float output = 0.0;
+
+  // NEW: fail-safe - the old code had no cutoff, so a fallen bot would keep
+  // commanding full motor speed into the floor indefinitely.
+  if (fabs(angle) > FALL_ANGLE) {
+    integral = 0.0;                // don't let the integral wind up while we're down
+    digitalWrite(enPin, HIGH);     // disable the drivers - HIGH = disabled on most TMC2209 boards
+  } else {
+    digitalWrite(enPin, LOW);      // enabled
+
+    // NEW: this whole block replaces the old `if (angle >> 0) {}` stub, which
+    // was also a compile error - bitwise shift (>>) isn't defined for a float.
+    float error = targetAngle - angle;
+
+    integral += error * dt;                                            // accumulates error over time so a small, persistent offset eventually gets corrected (not `=`, which would discard everything before it)
+    integral = constrain(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);    // anti-windup clamp
+
+    float derivative = (error - lastError) / dt;                       // rate of change of error - damps overshoot
+    lastError = error;
+
+    output = Kp * error + Ki * integral + Kd * derivative;
+    output = constrain(output, -MAX_SPEED, MAX_SPEED);                 // never ask the stepper for more than it can physically do
+  }
+
+  stepper.setSpeed(output);
+  stepper2.setSpeed(MOTOR2_INVERT * output);    // opposite-facing wheel gets the mirrored command
+
+  // NEW: throttled debug print - printing every 5ms control cycle would flood
+  // Serial and slow the loop down; this caps it to ~10 times/sec.
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint >= 100) {
+    lastPrint = millis();
+    Serial.print("angle: "); Serial.print(angle);
+    Serial.print("  output: "); Serial.println(output);
+  }
+}
