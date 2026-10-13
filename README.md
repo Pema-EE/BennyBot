@@ -1,6 +1,6 @@
 # BennyBot
-
-[BennyBot Simulation](https://wokwi.com/projects/476278603594848257)
+[BennyBot circuit sim
+](https://wokwi.com/projects/477792740217917441)
 
 A self balancing bot that will evolve as time passes.
 
